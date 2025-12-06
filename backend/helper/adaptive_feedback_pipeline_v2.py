@@ -1,4 +1,3 @@
-import faiss
 import pickle
 from openai import OpenAI
 import os
@@ -17,10 +16,14 @@ tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
 model.eval()
 
-# load FAISS index and metadata
-faiss_index = faiss.read_index("helper/db/embeddings_codebert.faiss")
 with open("helper/db/example_meta_codebert.pkl", "rb") as f:
     meta = pickle.load(f)
+
+with open("helper/db/example_embeddings_codebert.pkl", "rb") as f:
+    example_embeddings = pickle.load(f)    # numpy array [N, 768]
+
+# convert to torch tensor and normalize for cosine similarity
+example_embeddings = torch.tensor(example_embeddings, dtype=torch.float32)
 
 client = OpenAI()
 
@@ -38,22 +41,25 @@ def get_embedding(text: str):
     with torch.no_grad():
         outputs = model(**tokens)
         cls_embedding = outputs.last_hidden_state[0, 0]
-    
-    embedding = cls_embedding.numpy().astype("float32")
+        cls_embedding = torch.nn.functional.normalize(cls_embedding, dim=0)
+
+    emb = cls_embedding.numpy().astype("float32")
+
     del outputs, cls_embedding
     gc.collect()
-    
-    return embedding
+    return emb
 
 def retrieve_similar_examples(query: str, k=2):
-    emb = get_embedding(query).reshape(1, -1)
-    distances, indices = faiss_index.search(emb, k)
-    
-    results = []
-    for idx in indices[0]:
-        if 0 <= idx < len(meta):  
-            results.append(meta[idx])
-    return results
+    emb = get_embedding(query)             
+    emb = torch.tensor(emb, dtype=torch.float32)
+
+    # cosine similarity = dot product (since normalized)
+    scores = torch.matmul(example_embeddings, emb)  
+
+    top_idx = torch.topk(scores, k=min(k, len(meta))).indices.tolist()
+
+    return [meta[i] for i in top_idx]
+
 
 def build_prompt(query, examples, user_profile):
     SCHEMA = """
