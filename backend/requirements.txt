@@ -37,8 +37,7 @@ python-dotenv
 scikit-learn
 transformers
 torch
-scikit-learn
-sklearn-extra
+scikit-learn-extra
 
 
 
