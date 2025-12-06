@@ -38,6 +38,8 @@ scikit-learn
 transformers
 torch
 scikit-learn
+sklearn-extra
+
 
 
 
