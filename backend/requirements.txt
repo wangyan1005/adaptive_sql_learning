@@ -37,6 +37,6 @@ python-dotenv
 scikit-learn
 transformers
 torch
-gc
+
 
 
