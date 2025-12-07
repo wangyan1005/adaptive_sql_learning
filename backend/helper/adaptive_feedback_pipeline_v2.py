@@ -3,62 +3,135 @@ from openai import OpenAI
 import os
 from transformers import AutoTokenizer, AutoModel
 import torch
+import torch.nn.functional as F
 import gc
+from threading import Lock
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
-device = "cpu"
+DEVICE = "cpu"
 
-# initialize CodeBERT model and tokenizer
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
-model.eval()
-
-with open("helper/db/example_meta_codebert.pkl", "rb") as f:
-    meta = pickle.load(f)
-
-with open("helper/db/example_embeddings_codebert.pkl", "rb") as f:
-    example_embeddings = pickle.load(f)    # numpy array [N, 768]
-
-# convert to torch tensor and normalize for cosine similarity
-example_embeddings = torch.tensor(example_embeddings, dtype=torch.float32)
+# Globals 
+_tokenizer = None
+_model = None
+_example_meta = None
+_example_emb = None
+_example_emb_norm = None
+_loaded = False
+_model_lock = Lock()
 
 client = OpenAI()
 
-# generate embedding function
-def get_embedding(text: str):
-    """CodeBERT embedding"""
-    tokens = tokenizer(
+# Path
+BASE_DIR = os.path.dirname(__file__)
+DB_DIR = os.path.join(BASE_DIR, "db")
+META_PATH = os.path.join(DB_DIR, "example_meta_codebert.pkl")
+EMB_PATH = os.path.join(DB_DIR, "example_embeddings_codebert.pkl")
+
+# # initialize CodeBERT model and tokenizer
+# tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+# model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
+# model.eval()
+
+# with open("helper/db/example_meta_codebert.pkl", "rb") as f:
+#     meta = pickle.load(f)
+
+# with open("helper/db/example_embeddings_codebert.pkl", "rb") as f:
+#     example_embeddings = pickle.load(f)    # numpy array [N, 768]
+
+# # convert to torch tensor and normalize for cosine similarity
+# example_embeddings = torch.tensor(example_embeddings, dtype=torch.float32)
+
+client = OpenAI()
+
+def _load_once():
+    global _loaded, _tokenizer, _model, _example_meta, _example_emb, _example_emb_norm
+    if _loaded:
+        return
+
+    with _model_lock:
+        if _loaded:
+            return
+
+    _tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+    _model = AutoModel.from_pretrained("microsoft/codebert-base", low_cpu_mem_usage=True).to(DEVICE)
+    _model.eval()
+
+    with open(META_PATH, "rb") as f:
+        _example_meta = pickle.load(f)
+
+    with open(EMB_PATH, "rb") as f:
+        emb_np = pickle.load(f)
+
+    _example_emb = torch.tensor(emb_np, dtype=torch.float32)  # [N, 768]
+    _example_emb_norm = F.normalize(_example_emb, dim=1).to(DEVICE) 
+
+    del emb_np
+    gc.collect()
+
+    _loaded = True
+    print(f"[adaptive] Loaded {len(_example_meta)} examples | shape={_example_emb.shape}")
+
+@torch.no_grad()
+def _embed(text: str) -> torch.Tensor:
+    """Return normalized CodeBERT CLS embedding (1 x 768)."""
+    if not _loaded or _tokenizer is None:
+        return torch.empty((1, 768), dtype=torch.float32).to(DEVICE)
+    
+    tokens = _tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
         padding=True,
         max_length=256
-    )
-    
-    with torch.no_grad():
-        outputs = model(**tokens)
-        cls_embedding = outputs.last_hidden_state[0, 0]
-        cls_embedding = torch.nn.functional.normalize(cls_embedding, dim=0)
+    ).to(DEVICE)
 
-    emb = cls_embedding.numpy().astype("float32")
+    outputs = _model(**tokens)
+    cls = outputs.last_hidden_state[:, 0, :]  # [1, 768]
+    cls = F.normalize(cls, dim=1)
 
-    del outputs, cls_embedding
+    del outputs, tokens
     gc.collect()
-    return emb
+    return cls   
+
+# # generate embedding function
+# def get_embedding(text: str):
+#     """CodeBERT embedding"""
+#     tokens = tokenizer(
+#         text,
+#         return_tensors="pt",
+#         truncation=True,
+#         padding=True,
+#         max_length=256
+#     )
+    
+#     with torch.no_grad():
+#         outputs = model(**tokens)
+#         cls_embedding = outputs.last_hidden_state[0, 0]
+#         cls_embedding = torch.nn.functional.normalize(cls_embedding, dim=0)
+
+#     emb = cls_embedding.numpy().astype("float32")
+
+#     del outputs, cls_embedding
+#     gc.collect()
+#     return emb
 
 def retrieve_similar_examples(query: str, k=2):
-    emb = get_embedding(query)             
-    emb = torch.tensor(emb, dtype=torch.float32)
+    _load_once()
 
-    # cosine similarity = dot product (since normalized)
-    scores = torch.matmul(example_embeddings, emb)  
+    emb = _embed(query).squeeze() # [768]
+    
+    scores = torch.matmul(_example_emb_norm, emb) 
 
-    top_idx = torch.topk(scores, k=min(k, len(meta))).indices.tolist()
+    top_idx = torch.topk(scores, k=min(k, scores.size(0))).indices.tolist()
+    
+    results = [_example_meta[i] for i in top_idx]
 
-    return [meta[i] for i in top_idx]
+    del emb, scores
+    gc.collect()
+    return results
 
 
 def build_prompt(query, examples, user_profile):
@@ -246,7 +319,8 @@ Your feedback **must** follow this 3-part structure:
 ### JSON Response:
 """
 
-def generate_sql_feedback(query, user_profile): 
+def generate_sql_feedback(query, user_profile):
+    _load_once() 
     examples = retrieve_similar_examples(query, k=2)
     prompt = build_prompt(query, examples, user_profile)
 
