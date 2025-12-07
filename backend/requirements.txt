@@ -1,12 +1,14 @@
 flask
 flask-cors
 gunicorn
-openai==1.35.13
+openai
 firebase-admin
-torch==2.2.0
-transformers==4.40.0
+
+torch
+transformer
 sentencepiece
 numpy
+
 python-dotenv
 scikit-learn
 scikit-learn-extra
